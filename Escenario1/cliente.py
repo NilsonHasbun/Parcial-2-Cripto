@@ -1,61 +1,79 @@
 import socket
+import threading
 import json
-from Crypto.Util.number import getRandomRange
-from Crypto.Hash import SHA256
-from Crypto.Cipher import ChaCha20
+from diffiHellman import Keys
+from Crypto.Cipher import ChaCha20   # Cambiamos aquí
 from Crypto.Random import get_random_bytes
+import hashlib
 
-def main():
-    host = 'localhost'
-    port = 65432
-    client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    client_socket.connect((host, port))
-    print("Conectado al servidor {}:{}".format(host, port))
-    
-    # Recibir parámetros DH del servidor (p, g y la clave pública A)
-    data = client_socket.recv(4096)
-    server_params = json.loads(data.decode())
-    p = server_params["p"]
-    g = server_params["g"]
-    server_public = server_params["A"]
-    print("Parámetros recibidos del servidor: p={}, g={}, A={}".format(p, g, server_public))
-    
-    # Generar clave privada y calcular la clave pública del cliente
-    private_key = getRandomRange(2, p)
-    public_key = pow(g, private_key, p)
-    print("Clave pública del cliente:", public_key)
-    
-    # Enviar la clave pública del cliente al servidor (formato JSON)
-    client_dh = json.dumps({"B": public_key})
-    client_socket.sendall(client_dh.encode())
-    
-    # Calcular el secreto compartido
-    shared_secret = pow(server_public, private_key, p)
-    print("Secreto compartido:", shared_secret)
-    
-    # Derivar la clave simétrica utilizando SHA-256 sobre el secreto compartido
-    secret_bytes = shared_secret.to_bytes((shared_secret.bit_length() + 7) // 8, byteorder='big')
-    symmetric_key = SHA256.new(secret_bytes).digest()  # 32 bytes
-    print("Clave simétrica derivada (SHA-256):", symmetric_key.hex())
-    
-    # Bucle de comunicación: enviar mensajes cifrados hasta que el usuario escriba "exit"
+
+with open('parameters.json', 'r') as file:
+    parameters = json.load(file)
+
+# Tomamos el primer conjunto de parámetros
+params = parameters['parameters'][2]
+p = params['p']
+q = params['q']
+g = params['g']
+
+client = Keys(p, q, g)
+client.change_pvk()
+client.generate_public_key()  # Se envía al cliente
+public_key = client.pk 
+key = None
+
+def receive_messages(client_socket):
+    global key
+    k = True
+    # Escuchar periódicamente el canal
     while True:
-        message = input("Escribe un mensaje (o 'exit' para salir): ")
-        if message.strip() == "exit":
-            client_socket.sendall(message.encode())
+        try:
+            data = client_socket.recv(1024)
+            if not data:
+                break
+
+            # El primer mensaje contiene la llave
+            if k:
+                client.generate_simetric_key(int.from_bytes(data, byteorder='big'))
+                key = hashlib.sha256(client.simetricKey.to_bytes((client.simetricKey.bit_length()+7)//8, byteorder='big')).digest()
+                print(f"llave: {key.hex()}")
+                k = False
+            else:
+                # Divide los datos en nonce y mensaje
+                nonceS = data[:12]  # ChaCha20 usa nonce de 12 bytes
+                cipherText = data[12:]
+                # Decifra el mensaje con la llave y el nonce correspondiente
+                decipher = ChaCha20.new(key=key, nonce=nonceS)
+                text = decipher.decrypt(cipherText).decode()
+                print(f"Servidor: {text}")
+        except ConnectionResetError:
             break
-        
-        # Encriptar el mensaje utilizando ChaCha20 con un nonce de 8 bytes
-        nonce = get_random_bytes(8)
-        cipher = ChaCha20.new(key=symmetric_key, nonce=nonce)
-        ciphertext = cipher.encrypt(message.encode())
-        
-        # Enviar el nonce concatenado con el ciphertext
-        client_socket.sendall(nonce + ciphertext)
-        print("Mensaje cifrado enviado.")
-    
+
     client_socket.close()
-    print("Conexión cerrada.")
+
+def start_client(server_ip, server_port):
+    global key, public_key
+    client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+   
+    client_socket.connect((server_ip, server_port))
+   
+    receiver_thread = threading.Thread(target=receive_messages, args=(client_socket,))
+    receiver_thread.start()
+
+    while key is None:
+        pass
+
+    client_socket.sendall(public_key.to_bytes((public_key.bit_length()+7)//8, byteorder='big'))
+
+    while True:
+        message = input("Tu mensaje: ")
+        nonce = get_random_bytes(12)  # Nonce de 12 bytes
+        cipher = ChaCha20.new(key=key, nonce=nonce)
+        cipherText = cipher.encrypt(message.encode())
+        mess = nonce + cipherText
+        client_socket.sendall(mess)
 
 if __name__ == "__main__":
-    main()
+    server_ip = 'localhost'  # Cambia esto a la IP del servidor
+    server_port = 12345
+    start_client(server_ip, server_port)
